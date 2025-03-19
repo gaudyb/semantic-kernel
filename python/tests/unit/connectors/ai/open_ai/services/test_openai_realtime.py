@@ -5,7 +5,9 @@ from collections.abc import AsyncIterable
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from aiortc import AudioStreamTrack
+from openai import AsyncOpenAI
 from openai.resources.beta.realtime.realtime import AsyncRealtimeConnection, AsyncRealtimeConnectionManager
 from openai.types.beta.realtime import (
     ConversationItem,
@@ -39,6 +41,7 @@ from openai.types.beta.realtime import (
     SessionUpdatedEvent,
     SessionUpdateEvent,
 )
+from pydantic import ValidationError
 from pytest import fixture, mark, param, raises
 
 from semantic_kernel.connectors.ai.function_call_choice_configuration import FunctionCallChoiceConfiguration
@@ -75,6 +78,7 @@ from semantic_kernel.contents.text_content import TextContent
 from semantic_kernel.exceptions.content_exceptions import ContentException
 from semantic_kernel.functions import kernel_function
 from semantic_kernel.functions.kernel_function_metadata import KernelFunctionMetadata
+from semantic_kernel.kernel import Kernel
 
 events = [
     SessionCreatedEvent(type=ListenEvents.SESSION_CREATED, session=Session(id="session_id"), event_id="1"),
@@ -656,3 +660,169 @@ async def _stream_to_webrtc(client: OpenAIRealtimeWebRTC):
         async for parsed_msg in client._parse_event(msg):
             await client._receive_buffer.put(parsed_msg)
             await asyncio.sleep(0)
+
+
+@pytest.fixture
+async def openai_realtime_base():
+    kernel_mock = AsyncMock(spec=Kernel)
+    async_openai_mock = AsyncMock(spec=AsyncOpenAI)
+    audio_track_mock = AsyncMock(spec=AudioStreamTrack)
+    return OpenAIRealtimeWebRTC(
+        audio_track=audio_track_mock,
+        client=async_openai_mock,
+        ai_model_id="gpt-4o-realtime-preview",
+        kernel=kernel_mock,
+    )
+
+
+@pytest.fixture
+async def prepare_event():
+    def _prepare_event(**kwargs):
+        return ResponseAudioTranscriptDeltaEvent(**kwargs)
+
+    return _prepare_event
+
+
+@pytest.mark.asyncio
+async def test_initialization(openai_realtime_base):
+    """Test to verify proper creation and defaults settings initialization of OpenAIRealtimeWebRTC."""
+    assert openai_realtime_base.SUPPORTS_FUNCTION_CALLING is True
+    assert openai_realtime_base.kernel is not None
+
+
+@pytest.mark.asyncio
+async def test_send_method(openai_realtime_base):
+    """Test to ensure send method delegates to _send method correctly."""
+
+    # Mock _send method
+    openai_realtime_base._send = AsyncMock()
+
+    # Create a RealtimeTextEvent
+    text_event = RealtimeTextEvent(service_type=SendEvents.CONVERSATION_ITEM_CREATE, text=TextContent(text="Hello"))
+
+    # Call the send method
+    await openai_realtime_base.send(text_event)
+
+    # Assert _send was called correctly
+    openai_realtime_base._send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_update_session_with_no_kernel():
+    """Test update_session without kernel argument provided and with PromptExecutionSettings."""
+
+    async_openai_mock = AsyncMock(spec=AsyncOpenAI)
+    audio_track_mock = AsyncMock(spec=AudioStreamTrack)
+    mock_settings = AsyncMock(spec=PromptExecutionSettings)
+
+    base = OpenAIRealtimeWebRTC(audio_track=audio_track_mock, client=async_openai_mock, ai_model_id="gpt-3")
+
+    await base.update_session(settings=mock_settings, create_response=True)
+
+    assert not hasattr(base, "kernel")
+    assert base._current_settings is mock_settings
+
+
+@pytest.mark.asyncio
+async def test_update_session_with_kernel(openai_realtime_base):
+    """Test update_session updates with kernel and PromptExecutionSettings."""
+    with patch(
+        "semantic_kernel.connectors.ai.open_ai.services._open_ai_realtime.prepare_settings_for_function_calling",
+    ) as mocked_prepare:
+        settings = PromptExecutionSettings(service_id="test")
+
+        await openai_realtime_base.update_session(settings=settings, kernel=openai_realtime_base.kernel)
+
+        # Ensure kernel-related processes are executed
+        mocked_prepare.assert_called_once_with(
+            settings,
+            openai_realtime_base.get_prompt_execution_settings_class(),
+            openai_realtime_base._update_function_choice_settings_callback(),
+            kernel=openai_realtime_base.kernel,
+        )
+
+
+@pytest.mark.asyncio
+async def test_handle_audio_transcript_delta(openai_realtime_base, prepare_event):
+    """Test to ensure audio transcript delta is handled correctly."""
+
+    openai_realtime_base._receive_buffer = AsyncMock()
+
+    # Prepare a sample audio transcript event
+    sample_event = prepare_event(
+        type=ListenEvents.RESPONSE_AUDIO_TRANSCRIPT_DELTA.value,
+        delta="text",
+        content_index=0,
+        item_id="item_id",
+        output_index=0,
+        response_id="response_id",
+        event_id="event_id",
+    )
+
+    async for event in openai_realtime_base._parse_event(sample_event):
+        assert event.event_type == "text"
+
+
+# @pytest.mark.asyncio
+# async def test_parse_function_call_arguments_done_extended(openai_realtime_base):
+#     """Test parsing and execution of function call arguments done."""
+
+#     # Prepare mock data
+#     call_event = ResponseFunctionCallArgumentsDoneEvent(
+#         type=ListenEvents.RESPONSE_FUNCTION_CALL_ARGUMENTS_DONE.value,
+#         call_id="sample-id",
+#         item_id="1234",
+#         arguments='{"param": "value"}',
+#         content_index=0,
+#         output_index=0,
+#         response_id="response_id",
+#         event_id="event_id",
+#     )
+
+#     # Create chat history mock
+#     mock_chat_history = AsyncMock(ChatHistory)
+#     openai_realtime_base.kernel.invoke_function_call = AsyncMock()
+
+#     # Call the function
+#     async for event in openai_realtime_base._parse_function_call_arguments_done(call_event):
+#         pass
+
+#     # Ensure correct method is called in kernel
+#     openai_realtime_base.kernel.invoke_function_call.assert_called_with(
+#         FunctionCallContent(id="1234", plugin_name="", function_name="sample-id", arguments='{"param": "value"}'),
+#         mock_chat_history,
+#     )
+
+
+@pytest.mark.asyncio
+async def test_handle_unknown_event_type(prepare_event):
+    """Test handling of an unknown/unexpected event type."""
+
+    with pytest.raises(ValidationError):
+        # Prepare a sample unknown event
+        prepare_event(
+            type="unknown:event",
+            delta="text",
+            content_index=0,
+            item_id="item_id",
+            output_index=0,
+            response_id="response_id",
+            event_id="event_id",
+        )
+
+
+@pytest.mark.asyncio
+async def test_close_session(openai_realtime_base):
+    """Test session close functionality."""
+    # Mock close method of peer connection and data channel
+    if openai_realtime_base.peer_connection:
+        openai_realtime_base.peer_connection.close = AsyncMock()
+    if openai_realtime_base.data_channel:
+        openai_realtime_base.data_channel.close = AsyncMock()
+
+    # Call close_session and verify
+    await openai_realtime_base.close_session()
+    if openai_realtime_base.peer_connection:
+        openai_realtime_base.peer_connection.close.assert_awaited_once()
+    if openai_realtime_base.data_channel:
+        openai_realtime_base.data_channel.close.assert_awaited_once()
